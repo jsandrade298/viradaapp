@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, ScrollView, Image, Modal } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, Alert, ScrollView, Image, Modal, Linking } from 'react-native';
 import MapView, { Marker, PROVIDER_DEFAULT } from 'react-native-maps';
 import * as Location from 'expo-location';
 import { Ionicons } from '@expo/vector-icons';
@@ -11,10 +11,9 @@ export default function RadarScreen() {
   const [distance, setDistance] = useState<number | null>(null);
   
   const [events, setEvents] = useState<any[]>([]);
-  const [activeEvent, setActiveEvent] = useState<any>(null); 
+  const [activeEvent, setActiveEvent] = useState<any>(null); // O evento FÍSICO ativo no mapa
   const [currentUser, setCurrentUser] = useState<any>(null);
   
-  // Nossos dois estados de relacionamento do usuário com o evento
   const [userIntentions, setUserIntentions] = useState<string[]>([]); 
   const [userCheckins, setUserCheckins] = useState<string[]>([]);
 
@@ -28,7 +27,7 @@ export default function RadarScreen() {
   }, []);
 
   useEffect(() => {
-    if (location && activeEvent) {
+    if (location && activeEvent && !activeEvent.is_online) {
       const dist = getDistanceFromLatLonInMeters(
         location.coords.latitude, location.coords.longitude,
         activeEvent.latitude, activeEvent.longitude
@@ -41,8 +40,6 @@ export default function RadarScreen() {
     const { data: { user } } = await supabase.auth.getUser();
     if (user) {
       setCurrentUser(user);
-      
-      // Busca todos os registros do usuário na tabela de presença
       const { data: checkins } = await supabase
         .from('event_checkins')
         .select('event_id, status')
@@ -66,7 +63,9 @@ export default function RadarScreen() {
 
     if (data) {
       setEvents(data);
-      if (data.length > 0) setActiveEvent(data[0]); 
+      // MAPA INTELIGENTE: Só mira em eventos físicos
+      const physicalEvents = data.filter(e => !e.is_online);
+      if (physicalEvents.length > 0) setActiveEvent(physicalEvents[0]); 
     }
     setLoading(false);
   }
@@ -74,7 +73,6 @@ export default function RadarScreen() {
   async function startLocationTracking() {
     let { status } = await Location.requestForegroundPermissionsAsync();
     if (status !== 'granted') return;
-
     Location.watchPositionAsync(
       { accuracy: Location.Accuracy.High, timeInterval: 5000, distanceInterval: 10 },
       (newLocation) => setLocation(newLocation)
@@ -101,48 +99,52 @@ export default function RadarScreen() {
     return `${dia}/${mes} • ${hora}:${min}`;
   }
 
-  // --- O CHECK-IN FÍSICO (MAPA) ---
+  // --- CHECK-IN FÍSICO ---
   async function handleCheckin() {
     if (!currentUser || !activeEvent) return;
     setActionLoading(true);
-    
-    // O upsert converte o 'VOU_PARTICIPAR' para 'ESTOU_NA_LUTA' se a pessoa já tinha intenção
     await supabase.from('event_checkins').upsert({
-      event_id: activeEvent.id,
-      user_id: currentUser.id,
-      status: 'ESTOU_NA_LUTA',
-      checked_in_at: new Date().toISOString()
+      event_id: activeEvent.id, user_id: currentUser.id, status: 'ESTOU_NA_LUTA', checked_in_at: new Date().toISOString()
     });
-
     setActionLoading(false);
     setUserCheckins(prev => [...prev, activeEvent.id]);
     Alert.alert("A Luta é Nossa!", "Sua presença no território foi confirmada pela coordenação.");
     fetchEvents();
   }
 
-  // --- A INTENÇÃO (AGENDA) ---
-  async function handleParticipate(eventoParam: any) {
+  // --- CHECK-IN VIRTUAL MÁGICO ---
+  async function handleOnlineJoin(eventoParam: any) {
     if (!currentUser) return;
     setActionLoading(true);
 
+    // 1. Grava o check-in no Supabase silenciosamente
+    await supabase.from('event_checkins').upsert({
+      event_id: eventoParam.id, user_id: currentUser.id, status: 'ESTOU_NA_LUTA', checked_in_at: new Date().toISOString()
+    });
+    
+    setUserCheckins(prev => [...prev, eventoParam.id]);
+    setActionLoading(false);
+    fetchEvents();
+
+    // 2. Abre o aplicativo do Zoom/Meet no celular
+    if (eventoParam.meeting_link) {
+      Linking.openURL(eventoParam.meeting_link);
+    }
+  }
+
+  // --- INTENÇÃO ---
+  async function handleParticipate(eventoParam: any) {
+    if (!currentUser) return;
+    setActionLoading(true);
     const isParticipating = userIntentions.includes(eventoParam.id);
 
     if (isParticipating) {
-      await supabase.from('event_checkins')
-        .delete()
-        .eq('event_id', eventoParam.id)
-        .eq('user_id', currentUser.id)
-        .eq('status', 'VOU_PARTICIPAR');
+      await supabase.from('event_checkins').delete().eq('event_id', eventoParam.id).eq('user_id', currentUser.id).eq('status', 'VOU_PARTICIPAR');
       setUserIntentions(prev => prev.filter(id => id !== eventoParam.id));
     } else {
-      await supabase.from('event_checkins').upsert({
-        event_id: eventoParam.id,
-        user_id: currentUser.id,
-        status: 'VOU_PARTICIPAR'
-      });
+      await supabase.from('event_checkins').upsert({ event_id: eventoParam.id, user_id: currentUser.id, status: 'VOU_PARTICIPAR' });
       setUserIntentions(prev => [...prev, eventoParam.id]);
     }
-
     setActionLoading(false);
     fetchEvents();
   }
@@ -151,11 +153,7 @@ export default function RadarScreen() {
   const hasCheckedIn = activeEvent && userCheckins.includes(activeEvent.id);
 
   if (loading) {
-    return (
-      <View className="flex-1 bg-[#1a1a1a] justify-center items-center">
-        <ActivityIndicator size="large" color="#ff4500" />
-      </View>
-    );
+    return <View className="flex-1 bg-[#1a1a1a] justify-center items-center"><ActivityIndicator size="large" color="#ff4500" /></View>;
   }
 
   return (
@@ -172,60 +170,63 @@ export default function RadarScreen() {
         </TouchableOpacity>
       </View>
 
-      {/* TELA DE MAPA */}
-      {activeTab === 'mapa' && activeEvent && (
+      {/* MAPA (Só renderiza se tiver evento físico) */}
+      {activeTab === 'mapa' && (
         <View className="flex-1">
-          <MapView
-            style={styles.map}
-            provider={PROVIDER_DEFAULT}
-            initialRegion={{
-              latitude: activeEvent.latitude,
-              longitude: activeEvent.longitude,
-              latitudeDelta: 0.015,
-              longitudeDelta: 0.015,
-            }}
-            customMapStyle={darkMapStyle}
-            showsUserLocation={true}
-            mapPadding={{ top: 120, right: 10, bottom: 200, left: 10 }}
-          >
-            <Marker coordinate={{ latitude: activeEvent.latitude, longitude: activeEvent.longitude }} title={activeEvent.title} pinColor="#ff4500" />
-          </MapView>
-          
-          <View className="absolute bottom-6 left-6 right-6 z-10 bg-zinc-900 p-5 rounded-3xl border border-zinc-800 shadow-2xl">
-            <View className="flex-row items-center mb-2">
-              <View className="w-3 h-3 rounded-full bg-[#ff4500] mr-2 animate-pulse" />
-              <Text className="text-white font-bold text-base" numberOfLines={1}>{activeEvent.title}</Text>
-            </View>
-            <Text className="text-gray-400 text-sm mb-4 leading-5">
-              {/* Mostra o Endereço no Mapa! */}
-              {activeEvent.address || 'Endereço não informado'}
-              {distance !== null && !hasCheckedIn && (
-                <Text className="text-zinc-500 text-xs font-bold"> {'\n'}📍 A {Math.round(distance)} metros de distância.</Text>
-              )}
-            </Text>
-            
-            {/* Lógica do Botão do Mapa (Três Estados) */}
-            {hasCheckedIn ? (
-              <View className="w-full bg-emerald-900/40 py-3 rounded-xl flex-row items-center justify-center border border-emerald-500">
-                <Ionicons name="checkmark-circle" size={20} color="#10b981" className="mr-2" />
-                <Text className="text-emerald-500 font-bold text-sm uppercase tracking-wider">Você está na Luta!</Text>
-              </View>
-            ) : isNear ? (
-              <TouchableOpacity onPress={handleCheckin} disabled={actionLoading} className="w-full bg-[#ff4500] py-3 rounded-xl flex-row items-center justify-center shadow-lg">
-                {actionLoading ? <ActivityIndicator color="#ffffff" size="small" /> : (
-                  <><Ionicons name="location-sharp" size={20} color="#ffffff" className="mr-2" /><Text className="text-white font-bold text-sm uppercase tracking-wider">Estou na Luta</Text></>
+          {activeEvent ? (
+            <>
+              <MapView
+                style={styles.map}
+                provider={PROVIDER_DEFAULT}
+                initialRegion={{ latitude: activeEvent.latitude, longitude: activeEvent.longitude, latitudeDelta: 0.015, longitudeDelta: 0.015 }}
+                customMapStyle={darkMapStyle}
+                showsUserLocation={true}
+                mapPadding={{ top: 120, right: 10, bottom: 200, left: 10 }}
+              >
+                <Marker coordinate={{ latitude: activeEvent.latitude, longitude: activeEvent.longitude }} title={activeEvent.title} pinColor="#ff4500" />
+              </MapView>
+              
+              <View className="absolute bottom-6 left-6 right-6 z-10 bg-zinc-900 p-5 rounded-3xl border border-zinc-800 shadow-2xl">
+                <View className="flex-row items-center mb-2">
+                  <View className="w-3 h-3 rounded-full bg-[#ff4500] mr-2 animate-pulse" />
+                  <Text className="text-white font-bold text-base" numberOfLines={1}>{activeEvent.title}</Text>
+                </View>
+                <Text className="text-gray-400 text-sm mb-4 leading-5">
+                  {activeEvent.address || 'Endereço não informado'}
+                  {distance !== null && !hasCheckedIn && (
+                    <Text className="text-zinc-500 text-xs font-bold"> {'\n'}📍 A {Math.round(distance)} metros de distância.</Text>
+                  )}
+                </Text>
+                
+                {hasCheckedIn ? (
+                  <View className="w-full bg-emerald-900/40 py-3 rounded-xl flex-row items-center justify-center border border-emerald-500">
+                    <Ionicons name="checkmark-circle" size={20} color="#10b981" className="mr-2" />
+                    <Text className="text-emerald-500 font-bold text-sm uppercase tracking-wider">Você está na Luta!</Text>
+                  </View>
+                ) : isNear ? (
+                  <TouchableOpacity onPress={handleCheckin} disabled={actionLoading} className="w-full bg-[#ff4500] py-3 rounded-xl flex-row items-center justify-center shadow-lg">
+                    {actionLoading ? <ActivityIndicator color="#ffffff" size="small" /> : (
+                      <><Ionicons name="location-sharp" size={20} color="#ffffff" className="mr-2" /><Text className="text-white font-bold text-sm uppercase tracking-wider">Estou na Luta</Text></>
+                    )}
+                  </TouchableOpacity>
+                ) : (
+                  <View className="w-full bg-zinc-800 py-3 rounded-xl items-center border border-zinc-700 opacity-50">
+                    <Text className="text-gray-400 font-bold text-sm uppercase tracking-wider">Chegue mais perto para o Check-in</Text>
+                  </View>
                 )}
-              </TouchableOpacity>
-            ) : (
-              <View className="w-full bg-zinc-800 py-3 rounded-xl items-center border border-zinc-700 opacity-50">
-                <Text className="text-gray-400 font-bold text-sm uppercase tracking-wider">Chegue mais perto para o Check-in</Text>
               </View>
-            )}
-          </View>
+            </>
+          ) : (
+            // Mensagem se não houver eventos físicos próximos
+            <View className="flex-1 justify-center items-center bg-[#1a1a1a]">
+               <Ionicons name="map-outline" size={64} color="#3f3f46" />
+               <Text className="text-zinc-500 mt-4 font-bold text-lg">Nenhum evento de rua próximo.</Text>
+            </View>
+          )}
         </View>
       )}
 
-      {/* TELA DE AGENDA */}
+      {/* AGENDA */}
       {activeTab === 'agenda' && (
         <ScrollView className="flex-1" contentContainerStyle={{ paddingTop: 130, paddingHorizontal: 20, paddingBottom: 100 }} showsVerticalScrollIndicator={false}>
           <Text className="text-zinc-400 text-xs font-bold uppercase tracking-widest mb-4 ml-1">Próximos Eventos</Text>
@@ -235,11 +236,11 @@ export default function RadarScreen() {
             const progress = Math.min((confirmedCount / evento.volunteer_goal) * 100, 100);
             
             const isParticipating = userIntentions.includes(evento.id);
-            const isCheckedIn = userCheckins.includes(evento.id); // Se ele já foi no evento
+            const isCheckedIn = userCheckins.includes(evento.id);
 
             return (
               <TouchableOpacity key={evento.id} activeOpacity={0.8} onPress={() => setSelectedEvent(evento)} className="bg-zinc-900 rounded-2xl mb-6 border border-zinc-800 overflow-hidden shadow-lg">
-                <Image source={{ uri: 'https://images.unsplash.com/photo-1541872703-74c5e44368f9?q=80&w=500&auto=format&fit=crop' }} className="w-full h-32 opacity-80" resizeMode="cover" />
+                <Image source={{ uri: evento.is_online ? 'https://images.unsplash.com/photo-1590402494587-44b71d7772f6?q=80&w=500&auto=format&fit=crop' : 'https://images.unsplash.com/photo-1541872703-74c5e44368f9?q=80&w=500&auto=format&fit=crop' }} className="w-full h-32 opacity-80" resizeMode="cover" />
                 
                 <View className="p-5">
                   <View className="flex-row justify-between items-center mb-2">
@@ -250,9 +251,11 @@ export default function RadarScreen() {
                   <Text className="text-white text-xl font-black mb-1">{evento.title}</Text>
                   
                   <View className="flex-row items-center mb-5">
-                    <Ionicons name="location-outline" size={16} color="#9ca3af" />
-                    {/* Endereço real aqui também */}
-                    <Text className="text-gray-400 text-sm ml-1" numberOfLines={1}>{evento.address || 'Local a definir'}</Text>
+                    {/* Ícone Dinâmico (Globo para online, Pino para físico) */}
+                    <Ionicons name={evento.is_online ? "globe-outline" : "location-outline"} size={16} color={evento.is_online ? "#3b82f6" : "#9ca3af"} />
+                    <Text className={`text-sm ml-1 ${evento.is_online ? 'text-blue-400 font-bold' : 'text-gray-400'}`} numberOfLines={1}>
+                      {evento.is_online ? 'Evento Online' : (evento.address || 'Local a definir')}
+                    </Text>
                   </View>
 
                   <View className="mb-5">
@@ -265,18 +268,13 @@ export default function RadarScreen() {
                     </View>
                   </View>
 
-                  {/* Se o cara já tiver feito check-in, o card também reflete isso */}
                   {isCheckedIn ? (
                     <View className="w-full bg-emerald-900/40 py-3 rounded-xl flex-row items-center justify-center border border-emerald-500">
                       <Ionicons name="checkmark-circle" size={16} color="#10b981" />
                       <Text className="text-emerald-500 font-bold text-xs uppercase tracking-widest ml-2">Presença Confirmada</Text>
                     </View>
                   ) : (
-                    <TouchableOpacity 
-                      onPress={() => handleParticipate(evento)}
-                      disabled={actionLoading}
-                      className={`w-full py-3 rounded-xl flex-row items-center justify-center border ${isParticipating ? 'bg-zinc-800 border-zinc-700' : 'bg-transparent border-[#ff4500]'}`}
-                    >
+                    <TouchableOpacity onPress={() => handleParticipate(evento)} disabled={actionLoading} className={`w-full py-3 rounded-xl flex-row items-center justify-center border ${isParticipating ? 'bg-zinc-800 border-zinc-700' : 'bg-transparent border-[#ff4500]'}`}>
                       <Ionicons name={isParticipating ? "checkmark-circle" : "hand-right-outline"} size={16} color={isParticipating ? "#10b981" : "#ff4500"} />
                       <Text className={`font-bold text-xs uppercase tracking-widest ml-2 ${isParticipating ? 'text-gray-300' : 'text-[#ff4500]'}`}>
                         {isParticipating ? "Intenção Confirmada" : "Vou Participar"}
@@ -290,7 +288,7 @@ export default function RadarScreen() {
         </ScrollView>
       )}
 
-      {/* MODAL ELÁSTICO E COM ENDEREÇO */}
+      {/* MODAL */}
       <Modal visible={!!selectedEvent} animationType="slide" transparent={true} onRequestClose={() => setSelectedEvent(null)}>
         <View className="flex-1 bg-black/80 justify-end">
           <View className="bg-zinc-900 rounded-t-3xl h-[85%] border-t border-zinc-700 overflow-hidden relative">
@@ -299,16 +297,9 @@ export default function RadarScreen() {
               <Ionicons name="close" size={24} color="white" />
             </TouchableOpacity>
 
-            <Image source={{ uri: 'https://images.unsplash.com/photo-1541872703-74c5e44368f9?q=80&w=500&auto=format&fit=crop' }} className="w-full h-48 opacity-90" resizeMode="cover" />
+            <Image source={{ uri: selectedEvent?.is_online ? 'https://images.unsplash.com/photo-1590402494587-44b71d7772f6?q=80&w=500&auto=format&fit=crop' : 'https://images.unsplash.com/photo-1541872703-74c5e44368f9?q=80&w=500&auto=format&fit=crop' }} className="w-full h-48 opacity-90" resizeMode="cover" />
             
-            <ScrollView 
-              className="flex-1" 
-              contentContainerStyle={{ padding: 24, paddingBottom: 120, flexGrow: 1 }} // flexGrow resolve a elasticidade em textos curtos!
-              showsVerticalScrollIndicator={false}
-              bounces={true} 
-              alwaysBounceVertical={true} 
-              overScrollMode="always"
-            >
+            <ScrollView className="flex-1" contentContainerStyle={{ padding: 24, paddingBottom: 160, flexGrow: 1 }} showsVerticalScrollIndicator={false} bounces={true} alwaysBounceVertical={true} overScrollMode="always">
               <Text className="text-[#ff4500] text-sm font-bold uppercase mb-2">{selectedEvent?.communities?.name}</Text>
               <Text className="text-white text-3xl font-black mb-4">{selectedEvent?.title}</Text>
               
@@ -318,14 +309,14 @@ export default function RadarScreen() {
               </View>
               
               <View className="flex-row items-start mb-6">
-                <Ionicons name="location-outline" size={20} color="#9ca3af" className="mt-1" />
-                <Text className="text-gray-300 text-base ml-2 pr-6 leading-6">{selectedEvent?.address || 'Local a definir'}</Text>
+                <Ionicons name={selectedEvent?.is_online ? "laptop-outline" : "location-outline"} size={20} color={selectedEvent?.is_online ? "#3b82f6" : "#9ca3af"} className="mt-1" />
+                <Text className={`text-base ml-2 pr-6 leading-6 ${selectedEvent?.is_online ? 'text-blue-400 font-bold' : 'text-gray-300'}`}>
+                  {selectedEvent?.is_online ? 'Transmissão Online (Reunião Virtual)' : (selectedEvent?.address || 'Local a definir')}
+                </Text>
               </View>
 
               <Text className="text-white text-lg font-bold mt-2 mb-2">Sobre o Evento</Text>
-              <Text className="text-gray-400 text-base leading-7 mb-8 text-justify">
-                {selectedEvent?.description}
-              </Text>
+              <Text className="text-gray-400 text-base leading-7 mb-8 text-justify">{selectedEvent?.description}</Text>
             </ScrollView>
 
             <View className="absolute bottom-0 left-0 right-0 p-6 bg-zinc-900 border-t border-zinc-800">
@@ -336,24 +327,29 @@ export default function RadarScreen() {
                     <Text className="text-emerald-500 font-bold text-base uppercase tracking-wider">Você está na Luta!</Text>
                  </View>
               ) : (
-                <TouchableOpacity 
-                  onPress={() => handleParticipate(selectedEvent)} 
-                  disabled={actionLoading} 
-                  className={`w-full py-4 rounded-xl flex-row items-center justify-center shadow-lg border ${userIntentions.includes(selectedEvent?.id) ? 'bg-zinc-900 border-red-500' : 'bg-[#ff4500] border-[#ff4500]'}`}
-                >
-                  {actionLoading ? <ActivityIndicator color="#ffffff" size="small" /> : (
-                    <>
-                      <Ionicons name={userIntentions.includes(selectedEvent?.id) ? "close-circle-outline" : "hand-right-outline"} size={20} color={userIntentions.includes(selectedEvent?.id) ? "#ef4444" : "#ffffff"} className="mr-2" />
-                      <Text className={`font-bold text-base uppercase tracking-wider ${userIntentions.includes(selectedEvent?.id) ? 'text-red-500' : 'text-white'}`}>
-                        {userIntentions.includes(selectedEvent?.id) ? "Retirar Intenção" : "Confirmar Intenção"}
-                      </Text>
-                    </>
+                <>
+                  {/* BOTÃO EXCLUSIVO: Acessar Link + Check-in (Aparece só em evento online) */}
+                  {selectedEvent?.is_online && (
+                    <TouchableOpacity onPress={() => handleOnlineJoin(selectedEvent)} disabled={actionLoading} className="w-full bg-[#10b981] py-4 rounded-xl flex-row items-center justify-center shadow-lg mb-3">
+                      <Ionicons name="videocam" size={20} color="#ffffff" className="mr-2" />
+                      <Text className="text-white font-bold text-base uppercase tracking-wider">Entrar na Call e Check-in</Text>
+                    </TouchableOpacity>
                   )}
-                </TouchableOpacity>
+
+                  <TouchableOpacity onPress={() => handleParticipate(selectedEvent)} disabled={actionLoading} className={`w-full py-4 rounded-xl flex-row items-center justify-center shadow-lg border ${userIntentions.includes(selectedEvent?.id) ? 'bg-zinc-900 border-red-500' : 'bg-[#ff4500] border-[#ff4500]'}`}>
+                    {actionLoading ? <ActivityIndicator color="#ffffff" size="small" /> : (
+                      <>
+                        <Ionicons name={userIntentions.includes(selectedEvent?.id) ? "close-circle-outline" : "hand-right-outline"} size={20} color={userIntentions.includes(selectedEvent?.id) ? "#ef4444" : "#ffffff"} className="mr-2" />
+                        <Text className={`font-bold text-base uppercase tracking-wider ${userIntentions.includes(selectedEvent?.id) ? 'text-red-500' : 'text-white'}`}>
+                          {userIntentions.includes(selectedEvent?.id) ? "Retirar Intenção" : "Confirmar Intenção"}
+                        </Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+                </>
               )}
 
             </View>
-            
           </View>
         </View>
       </Modal>
@@ -361,7 +357,7 @@ export default function RadarScreen() {
     </View>
   );
 }
-
+//... (Os mesmos estilos chumbo do mapa)
 const styles = StyleSheet.create({ map: { width: '100%', height: '100%' } });
 const darkMapStyle = [
   { elementType: 'geometry', stylers: [{ color: '#242f3e' }] },
