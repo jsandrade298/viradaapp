@@ -2,8 +2,9 @@ import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react'
 import {
   View, Text, FlatList, TouchableOpacity, ActivityIndicator, ScrollView,
   Modal, TextInput, KeyboardAvoidingView, Platform, Alert, Image, Linking,
-  Dimensions, StatusBar, Animated, Pressable, PanResponder, SafeAreaView
+  Dimensions, StatusBar, Animated, Pressable, PanResponder
 } from 'react-native';
+import { useFocusEffect } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import * as ImagePicker from 'expo-image-picker';
 import * as DocumentPicker from 'expo-document-picker';
@@ -26,6 +27,15 @@ const SWIPE_THRESHOLD = 60;
 export default function FeedScreen() {
   const [posts, setPosts] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // --- CONTROLE DA FILA DE NOVIDADES (ESTILO X/TWITTER) ---
+  const [pendingFeed, setPendingFeed] = useState<any[] | null>(null);
+  const [newPostsCount, setNewPostsCount] = useState(0);
+  const postsRef = useRef<any[]>([]);
+  const feedListRef = useRef<FlatList>(null);
+
+  // Mantém a ref sincronizada com os posts atuais da tela para a busca em background
+  useEffect(() => { postsRef.current = posts; }, [posts]);
 
   // STORIES
   const [storyGroups, setStoryGroups] = useState<StoryGroup[]>([]);
@@ -62,14 +72,17 @@ export default function FeedScreen() {
   const [userVotes, setUserVotes] = useState<Record<string, number>>({});
   const [userInteractions, setUserInteractions] = useState<Record<string, string[]>>({});
 
-  // COMENTÁRIOS (estilo X/Threads — fullscreen + threaded)
+  // COMENTÁRIOS (estilo X — drill-down navigation)
   const [commentModalPost, setCommentModalPost] = useState<any>(null);
-  const [comments, setComments] = useState<any[]>([]);
+  const [allComments, setAllComments] = useState<any[]>([]);
   const [newComment, setNewComment] = useState('');
   const [loadingComments, setLoadingComments] = useState(false);
   const [sendingComment, setSendingComment] = useState(false);
-  const [replyingTo, setReplyingTo] = useState<any>(null); // Responder a comentário específico
+  const [commentStack, setCommentStack] = useState<any[]>([]);
+  const [commentLikes, setCommentLikes] = useState<Record<string, number>>({});
+  const [userCommentLikes, setUserCommentLikes] = useState<Set<string>>(new Set());
   const commentInputRef = useRef<TextInput>(null);
+  const commentSlideAnim = useRef(new Animated.Value(0)).current;
 
   // BOTTOM SHEET / MEDIA VIEWER
   const [mediaPickerVisible, setMediaPickerVisible] = useState(false);
@@ -77,15 +90,29 @@ export default function FeedScreen() {
   const sheetAnim = useRef(new Animated.Value(0)).current;
   const [mediaViewer, setMediaViewer] = useState<{ url: string; type: string } | null>(null);
 
-  // Sync refs
+  // Sync refs Stories
   useEffect(() => { storyGroupsRef.current = storyGroups; }, [storyGroups]);
   useEffect(() => { groupRef.current = activeGroupIdx; }, [activeGroupIdx]);
   useEffect(() => { storyRef.current = activeStoryIdx; }, [activeStoryIdx]);
 
-  useEffect(() => { fetchCurrentUser(); fetchFeed(); return () => { if (timerIdRef.current) clearTimeout(timerIdRef.current); }; }, []);
+  useEffect(() => { 
+    fetchCurrentUser(); 
+    return () => { if (timerIdRef.current) clearTimeout(timerIdRef.current); }; 
+  }, []);
 
-  // Carregar votos do user ao logar
-  useEffect(() => { if (currentUser) loadUserVotes(); }, [currentUser]);
+  // Busca silenciosa ao voltar para a tela (Lazy Refresh)
+  useFocusEffect(
+    useCallback(() => {
+      fetchFeed(true);
+    }, [])
+  );
+
+  useEffect(() => {
+    if (currentUser) {
+      loadUserVotes();
+      loadUserInteractions();
+    }
+  }, [currentUser, posts.length]);
 
   async function fetchCurrentUser() {
     const { data: { user } } = await supabase.auth.getUser();
@@ -95,19 +122,36 @@ export default function FeedScreen() {
     }
   }
 
-  // Carregar votos persistidos do banco
   async function loadUserVotes() {
     if (!currentUser) return;
-    const { data } = await supabase.from('poll_votes').select('post_id, option_index').eq('user_id', currentUser.id);
-    if (data) {
-      const votes: Record<string, number> = {};
-      data.forEach(v => { votes[v.post_id] = v.option_index; });
-      setUserVotes(votes);
-    }
+    try {
+      const { data } = await supabase.from('poll_votes').select('post_id, option_index').eq('user_id', currentUser.id);
+      if (data) {
+        const votes: Record<string, number> = {};
+        data.forEach(v => { votes[v.post_id] = v.option_index; });
+        setUserVotes(votes);
+      }
+    } catch (e) { console.warn('poll_votes não disponível:', e); }
   }
 
-  // ========== FETCH FEED ==========
-  async function fetchFeed() {
+  async function loadUserInteractions() {
+    if (!currentUser || posts.length === 0) return;
+    try {
+      const postIds = posts.map(p => p.id);
+      const { data: ints } = await supabase.from('post_interactions').select('post_id, interaction_type').eq('user_id', currentUser.id).in('post_id', postIds);
+      if (ints) {
+        const uInts: Record<string, string[]> = {};
+        ints.forEach(i => {
+          if (!uInts[i.post_id]) uInts[i.post_id] = [];
+          if (!uInts[i.post_id].includes(i.interaction_type)) uInts[i.post_id].push(i.interaction_type);
+        });
+        setUserInteractions(uInts);
+      }
+    } catch (e) { console.warn('Erro ao carregar interações do user:', e); }
+  }
+
+  // ========== FETCH FEED COM ALGORITMO DE FILA ==========
+  async function fetchFeed(isSilent = false) {
     const { data: ann } = await supabase.from('announcements').select('*, communities(id, name)')
       .gte('expires_at', new Date().toISOString()).order('created_at', { ascending: true });
     if (ann) {
@@ -125,31 +169,83 @@ export default function FeedScreen() {
       setStoryGroups(ordered);
     }
 
-    const { data: feedPosts } = await supabase.from('posts')
+    const { data: feedPosts, error: feedError } = await supabase.from('posts')
       .select(`id, content, media_url, media_type, link_url, poll_options, location_name, latitude, longitude, created_at, author_id,
-               profiles (full_name, avatar_url), communities (name), comments (count), post_interactions (count)`)
+               profiles!posts_author_id_fkey (full_name, avatar_url), communities (name)`)
       .order('created_at', { ascending: false });
+
+    if (feedError) { console.error('Erro ao buscar posts:', feedError); setLoading(false); return; }
+
     if (feedPosts && feedPosts.length > 0) {
       const postIds = feedPosts.map(p => p.id);
-      const { data: ints } = await supabase.from('post_interactions').select('post_id, interaction_type, user_id').in('post_id', postIds);
+
+      let commentCountMap: Record<string, number> = {};
+      try {
+        const { data: commentRows } = await supabase.from('comments').select('post_id').in('post_id', postIds);
+        if (commentRows) commentRows.forEach(c => { commentCountMap[c.post_id] = (commentCountMap[c.post_id] || 0) + 1; });
+      } catch (e) { console.warn('Erro ao contar comentários:', e); }
+
       const cMap: Record<string, { APOIAR: number; REPERCUTIR: number; SALVAR: number }> = {};
       const uInts: Record<string, string[]> = {};
       postIds.forEach(id => { cMap[id] = { APOIAR: 0, REPERCUTIR: 0, SALVAR: 0 }; });
-      if (ints) ints.forEach(i => {
-        if (cMap[i.post_id]) cMap[i.post_id][i.interaction_type as keyof typeof cMap[string]]++;
-        if (currentUser && i.user_id === currentUser.id) { if (!uInts[i.post_id]) uInts[i.post_id] = []; uInts[i.post_id].push(i.interaction_type); }
-      });
-      setPosts(feedPosts.map(p => ({
+
+      try {
+        const { data: ints } = await supabase.from('post_interactions').select('post_id, interaction_type, user_id').in('post_id', postIds);
+        const seenInts = new Set<string>();
+        if (ints) ints.forEach(i => {
+          const key = `${i.post_id}:${i.user_id}:${i.interaction_type}`;
+          if (!seenInts.has(key)) {
+            seenInts.add(key);
+            if (cMap[i.post_id]) cMap[i.post_id][i.interaction_type as keyof typeof cMap[string]]++;
+          }
+          if (currentUser && i.user_id === currentUser.id) { if (!uInts[i.post_id]) uInts[i.post_id] = []; if (!uInts[i.post_id].includes(i.interaction_type)) uInts[i.post_id].push(i.interaction_type); }
+        });
+      } catch (e) { console.warn('Erro ao contar interações:', e); }
+
+      const enriched = feedPosts.map(p => ({
         ...p, apoiar_count: cMap[p.id]?.APOIAR || 0, repercutir_count: cMap[p.id]?.REPERCUTIR || 0,
         salvar_count: cMap[p.id]?.SALVAR || 0,
-        comment_count: Array.isArray(p.comments) ? p.comments.length : (p.comments as any)?.[0]?.count || 0,
-      })));
+        comment_count: commentCountMap[p.id] || 0,
+      }));
+
       setUserInteractions(uInts);
+
+      // --- LÓGICA DE ATUALIZAÇÃO ESTILO X/TWITTER ---
+      if (isSilent && postsRef.current.length > 0) {
+        const currentIds = new Set(postsRef.current.map(p => p.id));
+        const totallyNew = enriched.filter(p => !currentIds.has(p.id));
+        
+        if (totallyNew.length > 0) {
+          // Se tem post novo, estoca na fila e mostra botão
+          setPendingFeed(enriched);
+          setNewPostsCount(totallyNew.length);
+        } else {
+          // Se não tem post novo (só likes/comentários novos), atualiza silenciosamente os números
+          setPosts(enriched);
+        }
+      } else {
+        // Primeira carga ou carga forçada (quando o próprio usuário posta algo)
+        setPosts(enriched);
+        setPendingFeed(null);
+        setNewPostsCount(0);
+      }
+    } else {
+      setPosts([]);
     }
     setLoading(false);
   }
 
-  // ========== INTERAÇÕES ==========
+  // Função disparada ao clicar no botão "Novas atualizações"
+  function applyPendingFeed() {
+    if (pendingFeed) {
+      setPosts(pendingFeed);
+      setPendingFeed(null);
+      setNewPostsCount(0);
+      feedListRef.current?.scrollToOffset({ offset: 0, animated: true });
+    }
+  }
+
+  // ========== INTERAÇÕES (deduplicated por user) ==========
   async function toggleInteraction(postId: string, type: 'APOIAR' | 'REPERCUTIR' | 'SALVAR') {
     if (!currentUser) return;
     const cur = userInteractions[postId] || [];
@@ -159,6 +255,9 @@ export default function FeedScreen() {
       setUserInteractions(p => ({ ...p, [postId]: (p[postId] || []).filter(t => t !== type) }));
       setPosts(p => p.map(x => x.id === postId ? { ...x, [`${type.toLowerCase()}_count`]: Math.max(0, x[`${type.toLowerCase()}_count`] - 1) } : x));
     } else {
+      const { data: existing } = await supabase.from('post_interactions')
+        .select('id').eq('post_id', postId).eq('user_id', currentUser.id).eq('interaction_type', type).maybeSingle();
+      if (existing) return;
       await supabase.from('post_interactions').insert({ post_id: postId, user_id: currentUser.id, interaction_type: type });
       setUserInteractions(p => ({ ...p, [postId]: [...(p[postId] || []), type] }));
       setPosts(p => p.map(x => x.id === postId ? { ...x, [`${type.toLowerCase()}_count`]: x[`${type.toLowerCase()}_count`] + 1 } : x));
@@ -166,50 +265,106 @@ export default function FeedScreen() {
   }
   function hasInt(pid: string, t: string) { return (userInteractions[pid] || []).includes(t); }
 
-  // ========== COMENTÁRIOS (threaded) ==========
+  // ========== COMENTÁRIOS (estilo X — drill-down) ==========
   async function openComments(post: any) {
     setCommentModalPost(post);
-    setReplyingTo(null);
+    setCommentStack([]);
     setNewComment('');
+    setCommentLikes({});
+    setUserCommentLikes(new Set());
     setLoadingComments(true);
-    const { data } = await supabase.from('comments').select('*, profiles(full_name, avatar_url)')
+    const { data } = await supabase.from('comments').select('*, profiles!comments_author_id_fkey(full_name, avatar_url)')
       .eq('post_id', post.id).order('created_at', { ascending: true });
-    setComments(data || []);
+    const cmts = data || [];
+    setAllComments(cmts);
+
+    if (cmts.length > 0) {
+      const cIds = cmts.map(c => c.id);
+      try {
+        const { data: likes } = await supabase.from('comment_likes').select('comment_id, user_id').in('comment_id', cIds);
+        if (likes) {
+          const counts: Record<string, number> = {};
+          const userSet = new Set<string>();
+          likes.forEach(l => {
+            counts[l.comment_id] = (counts[l.comment_id] || 0) + 1;
+            if (currentUser && l.user_id === currentUser.id) userSet.add(l.comment_id);
+          });
+          setCommentLikes(counts);
+          setUserCommentLikes(userSet);
+        }
+      } catch (e) { console.warn('comment_likes não disponível:', e); }
+    }
     setLoadingComments(false);
+  }
+
+  function closeCommentModal() {
+    setCommentModalPost(null);
+    setAllComments([]);
+    setNewComment('');
+    setCommentStack([]);
+    setCommentLikes({});
+    setUserCommentLikes(new Set());
+  }
+
+  function pushComment(comment: any) {
+    commentSlideAnim.setValue(SW);
+    setCommentStack(prev => [...prev, comment]);
+    setNewComment('');
+    Animated.spring(commentSlideAnim, { toValue: 0, useNativeDriver: true, tension: 65, friction: 11 }).start();
+  }
+
+  function popComment() {
+    if (commentStack.length === 0) return;
+    Animated.timing(commentSlideAnim, { toValue: SW, duration: 200, useNativeDriver: true }).start(() => {
+      setCommentStack(prev => prev.slice(0, -1));
+      setNewComment('');
+      commentSlideAnim.setValue(0);
+    });
+  }
+
+  function getCurrentParent() { return commentStack.length > 0 ? commentStack[commentStack.length - 1] : null; }
+  function getVisibleComments() {
+    const parent = getCurrentParent();
+    const parentId = parent?.id || null;
+    return allComments.filter(c => c.parent_id === parentId).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+  }
+  function getReplyCount(commentId: string): number { return allComments.filter(c => c.parent_id === commentId).length; }
+  function getTotalDescendants(commentId: string): number {
+    const directs = allComments.filter(c => c.parent_id === commentId);
+    let count = directs.length;
+    directs.forEach(d => { count += getTotalDescendants(d.id); });
+    return count;
   }
 
   async function sendComment() {
     if (!currentUser || !commentModalPost || !newComment.trim()) return;
     setSendingComment(true);
+    const parent = getCurrentParent();
     const payload: any = { post_id: commentModalPost.id, author_id: currentUser.id, content: newComment.trim() };
-    if (replyingTo) payload.parent_id = replyingTo.id;
-    const { data, error } = await supabase.from('comments').insert(payload).select('*, profiles(full_name, avatar_url)').single();
+    if (parent) payload.parent_id = parent.id;
+    const { data, error } = await supabase.from('comments').insert(payload).select('*, profiles!comments_author_id_fkey(full_name, avatar_url)').single();
     setSendingComment(false);
     if (!error && data) {
-      setComments(prev => [...prev, data]);
+      setAllComments(prev => [...prev, data]);
       setNewComment('');
-      setReplyingTo(null);
       setPosts(prev => prev.map(p => p.id === commentModalPost.id ? { ...p, comment_count: (p.comment_count || 0) + 1 } : p));
     }
   }
 
-  // Organizar comentários em árvore
-  function getThreadedComments() {
-    const roots = comments.filter(c => !c.parent_id);
-    const childMap: Record<string, any[]> = {};
-    comments.filter(c => c.parent_id).forEach(c => {
-      if (!childMap[c.parent_id]) childMap[c.parent_id] = [];
-      childMap[c.parent_id].push(c);
-    });
-    // Flatten: root, then its children
-    const flat: { comment: any; isReply: boolean; parentAuthor?: string }[] = [];
-    roots.forEach(r => {
-      flat.push({ comment: r, isReply: false });
-      (childMap[r.id] || []).forEach(child => {
-        flat.push({ comment: child, isReply: true, parentAuthor: r.profiles?.full_name });
-      });
-    });
-    return flat;
+  async function toggleCommentLike(commentId: string) {
+    if (!currentUser) return;
+    const liked = userCommentLikes.has(commentId);
+    if (liked) {
+      await supabase.from('comment_likes').delete().eq('comment_id', commentId).eq('user_id', currentUser.id);
+      setUserCommentLikes(prev => { const n = new Set(prev); n.delete(commentId); return n; });
+      setCommentLikes(prev => ({ ...prev, [commentId]: Math.max(0, (prev[commentId] || 1) - 1) }));
+    } else {
+      const { data: existing } = await supabase.from('comment_likes').select('comment_id').eq('comment_id', commentId).eq('user_id', currentUser.id).maybeSingle();
+      if (existing) return;
+      await supabase.from('comment_likes').insert({ comment_id: commentId, user_id: currentUser.id });
+      setUserCommentLikes(prev => new Set([...prev, commentId]));
+      setCommentLikes(prev => ({ ...prev, [commentId]: (prev[commentId] || 0) + 1 }));
+    }
   }
 
   function formatTimeAgo(d: string): string {
@@ -256,7 +411,6 @@ export default function FeedScreen() {
     }
   }
 
-  // Pular para próximo/anterior GRUPO inteiro (swipe horizontal)
   function nextGroup() {
     const gi = groupRef.current, groups = storyGroupsRef.current;
     if (gi === null || gi >= groups.length - 1) return;
@@ -286,7 +440,7 @@ export default function FeedScreen() {
   }
 
   function pauseStory() {
-    if (pausedRef.current) return; // Já pausado
+    if (pausedRef.current) return;
     pausedRef.current = true; setPaused(true);
     progress.stopAnimation(); clearStoryTimer();
     const elapsed = Date.now() - timerStartedRef.current;
@@ -303,37 +457,24 @@ export default function FeedScreen() {
     pausedRef.current = false; setPaused(false);
   }
 
-  // Swipe gesture handler para stories
   const storyPan = useRef(PanResponder.create({
     onStartShouldSetPanResponder: () => true,
     onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 10 || Math.abs(g.dy) > 10,
-    onPanResponderGrant: () => {
-      // Segurar = pausar
-      pauseStory();
-    },
+    onPanResponderGrant: () => { pauseStory(); },
     onPanResponderRelease: (_, g) => {
       const { dx, dy } = g;
       if (dy > SWIPE_THRESHOLD && Math.abs(dy) > Math.abs(dx)) {
-        // Swipe para baixo = fechar
         closeStories();
       } else if (dx < -SWIPE_THRESHOLD && Math.abs(dx) > Math.abs(dy)) {
-        // Swipe esquerda = próximo grupo
         nextGroup();
       } else if (dx > SWIPE_THRESHOLD && Math.abs(dx) > Math.abs(dy)) {
-        // Swipe direita = grupo anterior
         prevGroup();
       } else if (Math.abs(dx) < 15 && Math.abs(dy) < 15) {
-        // Tap (sem movimento significativo)
-        // Determinar lado: esquerdo (1/3) vs direito (2/3)
         resumeStory();
-        // Usar um setTimeout para processar o tap após o resume
         const tapX = g.x0;
         if (tapX < SW / 3) { prevStory(); }
         else { advanceStory(); }
-      } else {
-        // Movimento insuficiente para swipe, retomar
-        resumeStory();
-      }
+      } else { resumeStory(); }
     },
     onPanResponderTerminate: () => { resumeStory(); },
   })).current;
@@ -345,28 +486,27 @@ export default function FeedScreen() {
     return [...g, ...unseen, ...seen];
   }
 
-  // ========== ENQUETE COM PERSISTÊNCIA ==========
+  // ========== ENQUETE COM PERSISTÊNCIA (1 voto por user) ==========
   async function handlePollVote(pid: string, idx: number, opts: PollOption[]) {
     if (!currentUser) return;
     const prevVote = userVotes[pid];
     let updated: PollOption[];
 
     if (prevVote !== undefined) {
-      // Mudar voto: decrementar antigo, incrementar novo
-      if (prevVote === idx) return; // Mesmo voto
-      updated = opts.map((o, i) => ({
-        ...o,
-        votes: i === prevVote ? Math.max(0, o.votes - 1) : i === idx ? o.votes + 1 : o.votes
-      }));
-      // Atualizar no banco: poll_votes
+      if (prevVote === idx) return;
+      updated = opts.map((o, i) => ({ ...o, votes: i === prevVote ? Math.max(0, o.votes - 1) : i === idx ? o.votes + 1 : o.votes }));
       await supabase.from('poll_votes').update({ option_index: idx }).eq('post_id', pid).eq('user_id', currentUser.id);
     } else {
-      // Primeiro voto
-      updated = opts.map((o, i) => ({ ...o, votes: i === idx ? o.votes + 1 : o.votes }));
-      await supabase.from('poll_votes').insert({ post_id: pid, user_id: currentUser.id, option_index: idx });
+      const { data: existingVote } = await supabase.from('poll_votes').select('option_index').eq('post_id', pid).eq('user_id', currentUser.id).maybeSingle();
+      if (existingVote) {
+        if (existingVote.option_index === idx) return;
+        updated = opts.map((o, i) => ({ ...o, votes: i === existingVote.option_index ? Math.max(0, o.votes - 1) : i === idx ? o.votes + 1 : o.votes }));
+        await supabase.from('poll_votes').update({ option_index: idx }).eq('post_id', pid).eq('user_id', currentUser.id);
+      } else {
+        updated = opts.map((o, i) => ({ ...o, votes: i === idx ? o.votes + 1 : o.votes }));
+        await supabase.from('poll_votes').insert({ post_id: pid, user_id: currentUser.id, option_index: idx });
+      }
     }
-
-    // Atualizar poll_options no post
     await supabase.from('posts').update({ poll_options: updated }).eq('id', pid);
     setUserVotes(p => ({ ...p, [pid]: idx }));
     setPosts(p => p.map(x => x.id === pid ? { ...x, poll_options: updated } : x));
@@ -416,6 +556,7 @@ export default function FeedScreen() {
     return { url: supabase.storage.from('post_media').getPublicUrl(fn).data.publicUrl, type: attachment.type || 'image' };
   }
   function canPublish() { return newPostContent.trim().length > 0 || !!attachment || (showLinkInput && linkUrl.trim().length > 0) || (showPollEditor && pollOptions.filter(o => o.trim()).length >= 2); }
+  
   async function handleCreatePost() {
     if (!canPublish()) return;
     setIsPublishing(true);
@@ -426,7 +567,7 @@ export default function FeedScreen() {
     if (showPollEditor) { const v = pollOptions.filter(o => o.trim()); if (v.length >= 2) fp = v.map(t => ({ text: t.trim(), votes: 0 })); }
     const { error } = await supabase.from('posts').insert({ author_id: user.id, content: newPostContent.trim() || null, media_url: mUrl, media_type: mType, link_url: (showLinkInput && linkUrl.trim()) ? linkUrl.trim() : null, poll_options: fp, location_name: postLocation?.name || null, latitude: postLocation?.latitude || null, longitude: postLocation?.longitude || null });
     setIsPublishing(false);
-    if (error) { Alert.alert("Erro"); console.error(error); } else { resetPostModal(); fetchFeed(); }
+    if (error) { Alert.alert("Erro"); console.error(error); } else { resetPostModal(); fetchFeed(false); } // fetchFeed(false) Força a mostrar o post que VOCÊ criou sem pedir botão
   }
 
   function getDocIcon(f?: string) { const e = f?.split('.').pop()?.toLowerCase(); if (e === 'pdf') return 'document-text'; if (['doc','docx'].includes(e||'')) return 'document'; if (['xls','xlsx'].includes(e||'')) return 'grid'; return 'document-text-outline'; }
@@ -479,7 +620,8 @@ export default function FeedScreen() {
   const activeGroup = activeGroupIdx !== null ? storyGroupsRef.current[activeGroupIdx] : null;
   const activeStory = activeGroup?.stories[activeStoryIdx] || null;
   const sortedGroups = getSortedStoryGroups();
-  const threadedComments = commentModalPost ? getThreadedComments() : [];
+  const visibleComments = commentModalPost ? getVisibleComments() : [];
+  const currentParent = getCurrentParent();
 
   return (
     <View className="flex-1 bg-[#1a1a1a]">
@@ -492,8 +634,30 @@ export default function FeedScreen() {
         </View>
       </View>
 
+      {/* BOTÃO FLUTUANTE DE ATUALIZAÇÃO (X / TWITTER STYLE) */}
+      {newPostsCount > 0 && (
+        <View className="absolute top-28 left-0 right-0 items-center z-50">
+          <TouchableOpacity 
+            onPress={applyPendingFeed} 
+            className="bg-[#ff4500] px-5 py-2.5 rounded-full shadow-2xl flex-row items-center border border-[#ea580c]"
+            activeOpacity={0.8}
+            style={{ elevation: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.4, shadowRadius: 5 }}
+          >
+            <Ionicons name="arrow-up" size={16} color="white" />
+            <Text className="text-white font-bold text-sm ml-1.5">
+              {newPostsCount} {newPostsCount === 1 ? 'nova atualização' : 'novas atualizações'}
+            </Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {/* FEED */}
-      <FlatList data={posts} keyExtractor={i => i.id} contentContainerStyle={{ padding: 16, paddingBottom: 100 }} showsVerticalScrollIndicator={false}
+      <FlatList 
+        ref={feedListRef}
+        data={posts} 
+        keyExtractor={i => i.id} 
+        contentContainerStyle={{ padding: 16, paddingBottom: 100 }} 
+        showsVerticalScrollIndicator={false}
         ListHeaderComponent={() => (
           <View className="mb-6">
             <Text className="text-zinc-400 text-xs font-bold uppercase tracking-widest mb-4 ml-1">Radar de Ações</Text>
@@ -584,83 +748,164 @@ export default function FeedScreen() {
         </KeyboardAvoidingView>
       </Modal>
 
-      {/* ===== COMENTÁRIOS FULLSCREEN (estilo X/Threads) ===== */}
-      <Modal visible={!!commentModalPost} animationType="slide" transparent={false} onRequestClose={() => { setCommentModalPost(null); setComments([]); setNewComment(''); setReplyingTo(null); }}>
+      {/* ===== COMENTÁRIOS FULLSCREEN (estilo X — drill-down) ===== */}
+      <Modal visible={!!commentModalPost} animationType="slide" transparent={false} onRequestClose={() => { commentStack.length > 0 ? popComment() : closeCommentModal(); }}>
         <View className="flex-1 bg-[#1a1a1a]">
-          {/* Header */}
+          {/* Header dinâmico */}
           <View className="flex-row items-center justify-between px-4 pt-14 pb-3 border-b border-zinc-800">
-            <TouchableOpacity onPress={() => { setCommentModalPost(null); setComments([]); setNewComment(''); setReplyingTo(null); }}><Ionicons name="arrow-back" size={24} color="white" /></TouchableOpacity>
-            <Text className="text-white font-bold text-lg">Discussão</Text>
-            <View style={{ width: 24 }} />
+            <TouchableOpacity onPress={() => { commentStack.length > 0 ? popComment() : closeCommentModal(); }} className="w-10 h-10 items-center justify-center -ml-2">
+              <Ionicons name="arrow-back" size={24} color="white" />
+            </TouchableOpacity>
+            <Text className="text-white font-bold text-lg">{commentStack.length > 0 ? 'Respostas' : 'Discussão'}</Text>
+            <View style={{ width: 40 }} />
           </View>
 
           <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} className="flex-1">
             <FlatList
-              data={threadedComments}
-              keyExtractor={(item, idx) => item.comment.id || String(idx)}
+              data={visibleComments}
+              keyExtractor={(item) => item.id}
               contentContainerStyle={{ paddingBottom: 16 }}
-              ListHeaderComponent={() => commentModalPost ? (
-                <View className="px-4 pt-5 pb-4 border-b border-zinc-800 mb-2">
-                  {/* Post original */}
-                  <View className="flex-row items-center mb-3">
-                    <View className="w-10 h-10 bg-zinc-700 rounded-full items-center justify-center"><Text className="text-white font-bold text-lg">{commentModalPost.profiles?.full_name?.charAt(0)||'?'}</Text></View>
-                    <View className="ml-3"><Text className="text-white font-bold text-base">{commentModalPost.profiles?.full_name}</Text><Text className="text-gray-500 text-xs">{formatTimeAgo(commentModalPost.created_at)}</Text></View>
+              ListHeaderComponent={() => {
+                // Nível raiz: mostra o post original
+                if (commentStack.length === 0 && commentModalPost) return (
+                  <View className="px-4 pt-5 pb-4 border-b border-zinc-800 mb-1">
+                    <View className="flex-row items-center mb-3">
+                      <View className="w-11 h-11 bg-zinc-700 rounded-full items-center justify-center">
+                        <Text className="text-white font-bold text-lg">{commentModalPost.profiles?.full_name?.charAt(0)||'?'}</Text>
+                      </View>
+                      <View className="ml-3">
+                        <Text className="text-white font-bold text-base">{commentModalPost.profiles?.full_name}</Text>
+                        <Text className="text-gray-500 text-xs">{formatTimeAgo(commentModalPost.created_at)}</Text>
+                      </View>
+                    </View>
+                    {commentModalPost.content ? <Text className="text-gray-200 text-base leading-6 mb-3">{commentModalPost.content}</Text> : null}
+                    {renderPostMedia(commentModalPost)}
+                    {renderPostLink(commentModalPost)}
+                    {renderPostPoll(commentModalPost)}
+                    <View className="flex-row items-center mt-2 pt-3 border-t border-zinc-800">
+                      <Ionicons name="chatbubble-outline" size={14} color="#9ca3af" />
+                      <Text className="text-gray-500 text-sm ml-1.5">{commentModalPost.comment_count||0}</Text>
+                      <Text className="text-gray-600 mx-3">·</Text>
+                      <Ionicons name="flame" size={14} color="#9ca3af" />
+                      <Text className="text-gray-500 text-sm ml-1.5">{commentModalPost.apoiar_count||0}</Text>
+                    </View>
                   </View>
-                  {commentModalPost.content ? <Text className="text-gray-200 text-base leading-6 mb-3">{commentModalPost.content}</Text> : null}
-                  {renderPostMedia(commentModalPost)}
-                  {renderPostLink(commentModalPost)}
-                  {renderPostPoll(commentModalPost)}
-                  <View className="flex-row items-center mt-2 pt-3 border-t border-zinc-800">
-                    <Text className="text-gray-500 text-sm">{commentModalPost.comment_count||0} comentários</Text>
-                    <Text className="text-gray-600 mx-2">·</Text>
-                    <Text className="text-gray-500 text-sm">{commentModalPost.apoiar_count||0} apoios</Text>
+                );
+                // Nível drill-down: mostra comentário-pai com destaque
+                if (currentParent) return (
+                  <View className="bg-zinc-900/80 border-b border-zinc-800 px-4 pt-4 pb-3 mb-1">
+                    {/* Breadcrumb */}
+                    {commentStack.length > 1 && (
+                      <View className="flex-row items-center mb-2">
+                        <Ionicons name="return-up-back" size={14} color="#6b7280" />
+                        <Text className="text-gray-500 text-xs ml-1.5">
+                          {commentStack.length - 1} {commentStack.length - 1 === 1 ? 'nível acima' : 'níveis acima'}
+                        </Text>
+                      </View>
+                    )}
+                    <View className="flex-row">
+                      <View className="items-center mr-3">
+                        <View className="w-10 h-10 bg-zinc-700 rounded-full items-center justify-center">
+                          <Text className="text-white font-bold text-sm">{currentParent.profiles?.full_name?.charAt(0)||'?'}</Text>
+                        </View>
+                        {/* Linha vertical conectando ao conteúdo abaixo */}
+                        <View className="w-[2px] flex-1 bg-zinc-700 mt-2 rounded-full" />
+                      </View>
+                      <View className="flex-1 pb-2">
+                        <View className="flex-row items-center">
+                          <Text className="text-white font-bold text-sm mr-2">{currentParent.profiles?.full_name}</Text>
+                          <Text className="text-zinc-500 text-xs">{formatTimeAgo(currentParent.created_at)}</Text>
+                        </View>
+                        <Text className="text-gray-200 text-sm leading-5 mt-1">{currentParent.content}</Text>
+                        <View className="flex-row items-center mt-2.5" style={{ gap: 16 }}>
+                          <TouchableOpacity onPress={() => toggleCommentLike(currentParent.id)} className="flex-row items-center">
+                            <Ionicons name={userCommentLikes.has(currentParent.id) ? 'flame' : 'flame-outline'} size={15} color={userCommentLikes.has(currentParent.id) ? '#ff4500' : '#6b7280'} />
+                            {(commentLikes[currentParent.id]||0) > 0 && <Text className={`text-xs ml-1 ${userCommentLikes.has(currentParent.id) ? 'text-[#ff4500]' : 'text-gray-500'}`}>{commentLikes[currentParent.id]}</Text>}
+                          </TouchableOpacity>
+                          <View className="flex-row items-center">
+                            <Ionicons name="chatbubble-outline" size={14} color="#6b7280" />
+                            <Text className="text-gray-500 text-xs ml-1">{visibleComments.length}</Text>
+                          </View>
+                        </View>
+                      </View>
+                    </View>
                   </View>
-                </View>
-              ) : null}
+                );
+                return null;
+              }}
               ListEmptyComponent={() => !loadingComments ? (
-                <View className="py-12 items-center">
-                  <Ionicons name="chatbubble-outline" size={40} color="#3f3f46" />
-                  <Text className="text-zinc-500 text-base mt-3">Nenhum comentário ainda</Text>
-                  <Text className="text-zinc-600 text-sm mt-1">Seja o primeiro a comentar!</Text>
+                <View className="py-16 items-center">
+                  <View className="w-16 h-16 bg-zinc-800 rounded-full items-center justify-center mb-4">
+                    <Ionicons name="chatbubble-outline" size={28} color="#3f3f46" />
+                  </View>
+                  <Text className="text-zinc-400 text-base font-medium">Nenhuma resposta ainda</Text>
+                  <Text className="text-zinc-600 text-sm mt-1">Seja o primeiro a responder!</Text>
                 </View>
               ) : <View className="py-12 items-center"><ActivityIndicator color="#ff4500" /></View>}
-              renderItem={({ item: { comment: c, isReply, parentAuthor } }) => (
-                <View className={`flex-row px-4 py-2 ${isReply ? 'ml-12' : ''}`}>
-                  {/* Linha de conexão */}
-                  {isReply && <View className="absolute left-[36px] top-0 bottom-0 w-[2px] bg-zinc-800" style={{ height: '100%' }} />}
-                  <View className={`${isReply ? 'w-8 h-8' : 'w-10 h-10'} bg-zinc-700 rounded-full items-center justify-center mr-3`}>
-                    <Text className={`text-white font-bold ${isReply ? 'text-xs' : 'text-sm'}`}>{c.profiles?.full_name?.charAt(0)||'?'}</Text>
-                  </View>
-                  <View className="flex-1">
-                    <View className="flex-row items-center">
-                      <Text className="text-white font-bold text-sm mr-2">{c.profiles?.full_name}</Text>
-                      <Text className="text-zinc-500 text-xs">{formatTimeAgo(c.created_at)}</Text>
+              renderItem={({ item: c }) => {
+                const liked = userCommentLikes.has(c.id);
+                const likeCount = commentLikes[c.id] || 0;
+                const replyCount = getTotalDescendants(c.id);
+                const hasReplies = replyCount > 0;
+                return (
+                  <View className="px-4 py-3 border-b border-zinc-800/50">
+                    <View className="flex-row">
+                      <View className="w-10 h-10 bg-zinc-700 rounded-full items-center justify-center mr-3">
+                        <Text className="text-white font-bold text-sm">{c.profiles?.full_name?.charAt(0)||'?'}</Text>
+                      </View>
+                      <View className="flex-1">
+                        <View className="flex-row items-center">
+                          <Text className="text-white font-bold text-sm mr-2">{c.profiles?.full_name}</Text>
+                          <Text className="text-zinc-500 text-xs">{formatTimeAgo(c.created_at)}</Text>
+                        </View>
+                        <Text className="text-gray-200 text-sm leading-5 mt-1.5">{c.content}</Text>
+                        {/* Barra de ações */}
+                        <View className="flex-row items-center mt-3" style={{ gap: 20 }}>
+                          {/* Foguinho (reação) */}
+                          <TouchableOpacity onPress={() => toggleCommentLike(c.id)} className="flex-row items-center" activeOpacity={0.6}>
+                            <Ionicons name={liked ? 'flame' : 'flame-outline'} size={17} color={liked ? '#ff4500' : '#6b7280'} />
+                            {likeCount > 0 && <Text className={`text-xs ml-1.5 font-medium ${liked ? 'text-[#ff4500]' : 'text-gray-500'}`}>{likeCount}</Text>}
+                          </TouchableOpacity>
+                          {/* Balão de respostas — drill-down */}
+                          <TouchableOpacity
+                            onPress={() => pushComment(c)}
+                            className="flex-row items-center"
+                            activeOpacity={0.6}
+                          >
+                            <Ionicons name="chatbubble-outline" size={16} color={hasReplies ? '#9ca3af' : '#4b5563'} />
+                            {hasReplies && (
+                              <Text className="text-gray-400 text-xs ml-1.5 font-medium">{replyCount}</Text>
+                            )}
+                          </TouchableOpacity>
+                        </View>
+                        {/* Link "ver respostas" quando há replies */}
+                        {hasReplies && (
+                          <TouchableOpacity onPress={() => pushComment(c)} className="mt-2.5" activeOpacity={0.7}>
+                            <Text className="text-[#ff4500] text-xs font-bold">
+                              Ver {replyCount} resposta{replyCount > 1 ? 's' : ''}
+                            </Text>
+                          </TouchableOpacity>
+                        )}
+                      </View>
                     </View>
-                    {isReply && parentAuthor && (
-                      <Text className="text-gray-500 text-xs mb-0.5">respondendo a <Text className="text-[#ff4500]">{parentAuthor}</Text></Text>
-                    )}
-                    <Text className="text-gray-300 text-sm leading-5 mt-1">{c.content}</Text>
-                    {/* Botão responder */}
-                    <TouchableOpacity onPress={() => { setReplyingTo(c); commentInputRef.current?.focus(); }} className="mt-2 mb-1">
-                      <Text className="text-gray-500 text-xs font-medium">Responder</Text>
-                    </TouchableOpacity>
                   </View>
-                </View>
-              )}
+                );
+              }}
             />
 
             {/* Input fixo no fundo */}
             <View className="border-t border-zinc-800 bg-zinc-900">
-              {replyingTo && (
+              {currentParent && (
                 <View className="flex-row items-center px-4 pt-2">
-                  <Text className="text-gray-500 text-xs flex-1">Respondendo a <Text className="text-[#ff4500] font-bold">{replyingTo.profiles?.full_name}</Text></Text>
-                  <TouchableOpacity onPress={() => setReplyingTo(null)}><Ionicons name="close-circle" size={16} color="#6b7280" /></TouchableOpacity>
+                  <Text className="text-gray-500 text-xs flex-1">Respondendo a <Text className="text-[#ff4500] font-bold">{currentParent.profiles?.full_name}</Text></Text>
                 </View>
               )}
               <View className="flex-row items-center px-4 py-3 pb-8">
-                <View className="w-9 h-9 bg-zinc-700 rounded-full items-center justify-center mr-3"><Text className="text-white font-bold text-sm">{currentUser?.profile?.full_name?.charAt(0)||'?'}</Text></View>
+                <View className="w-9 h-9 bg-zinc-700 rounded-full items-center justify-center mr-3">
+                  <Text className="text-white font-bold text-sm">{currentUser?.profile?.full_name?.charAt(0)||'?'}</Text>
+                </View>
                 <View className="flex-1 bg-zinc-800 rounded-2xl flex-row items-center px-4 py-2 border border-zinc-700">
-                  <TextInput ref={commentInputRef} className="flex-1 text-white text-sm" placeholder={replyingTo ? `Responder ${replyingTo.profiles?.full_name}...` : 'Comentar...'} placeholderTextColor="#6b7280" value={newComment} onChangeText={setNewComment} multiline style={{ maxHeight: 80 }} />
+                  <TextInput ref={commentInputRef} className="flex-1 text-white text-sm" placeholder={currentParent ? `Responder ${currentParent.profiles?.full_name}...` : 'Comentar...'} placeholderTextColor="#6b7280" value={newComment} onChangeText={setNewComment} multiline style={{ maxHeight: 80 }} />
                 </View>
                 <TouchableOpacity onPress={sendComment} disabled={!newComment.trim() || sendingComment} className="ml-3">
                   {sendingComment ? <ActivityIndicator size="small" color="#ff4500" /> : <Ionicons name="send" size={24} color={newComment.trim() ? '#ff4500' : '#6b7280'} />}
@@ -676,9 +921,9 @@ export default function FeedScreen() {
         <View className="flex-1 bg-black" {...storyPan.panHandlers}>
           {activeGroup && activeStory && (
             <>
-              {/* Barras de progresso — descer do topo para não ativar notification bar */}
-              <SafeAreaView>
-                <View className="flex-row px-3 mt-2 gap-1">
+              {/* Barras de progresso — padding seguro para Android e iOS */}
+              <View style={{ paddingTop: Platform.OS === 'android' ? (StatusBar.currentHeight || 40) + 12 : 54 }}>
+                <View className="flex-row px-3 gap-1">
                   {activeGroup.stories.map((_: any, idx: number) => (
                     <View key={idx} className="h-[3px] flex-1 bg-zinc-700 rounded-full overflow-hidden">
                       {idx < activeStoryIdx ? <View className="h-full w-full bg-white rounded-full" /> :
@@ -687,8 +932,8 @@ export default function FeedScreen() {
                   ))}
                 </View>
 
-                {/* Header — dentro do SafeAreaView */}
-                <View className="flex-row items-center justify-between px-4 mt-3">
+                {/* Header */}
+                <View className="flex-row items-center justify-between px-4 mt-4">
                   <View className="flex-row items-center">
                     <View className={`w-10 h-10 rounded-full border-2 items-center justify-center ${activeGroup.isGlobal ? 'border-red-500 bg-red-900/50' : 'border-[#ff4500] bg-zinc-800'}`}>
                       {activeGroup.isGlobal ? <Ionicons name="megaphone" size={18} color="white" /> : <Text className="text-white font-bold">{activeGroup.sourceName.charAt(0)}</Text>}
@@ -697,7 +942,7 @@ export default function FeedScreen() {
                   </View>
                   <TouchableOpacity onPress={closeStories} className="p-2"><Ionicons name="close" size={28} color="white" /></TouchableOpacity>
                 </View>
-              </SafeAreaView>
+              </View>
 
               {/* Conteúdo do story */}
               <View className="flex-1 justify-center px-6">
@@ -710,9 +955,6 @@ export default function FeedScreen() {
                 )}
                 {activeGroup.isGlobal && <View className="mt-16 items-center w-full"><TouchableOpacity className="bg-[#ff4500] py-4 w-full rounded-2xl flex-row items-center justify-center shadow-lg"><Ionicons name="location-sharp" size={22} color="white" /><Text className="text-white font-black text-base uppercase tracking-widest ml-2">Apoiar no Radar</Text></TouchableOpacity></View>}
               </View>
-
-              {/* Indicador de pausa */}
-              {paused && <View className="absolute top-1/2 left-0 right-0 items-center" style={{ marginTop: -20 }}><View className="bg-black/60 px-4 py-2 rounded-full flex-row items-center"><Ionicons name="pause" size={16} color="white" /><Text className="text-white text-sm font-medium ml-2">Pausado</Text></View></View>}
 
               {/* Dica de swipe (só nos primeiros usos) */}
               <View className="flex-row justify-center pb-8 gap-1.5">
